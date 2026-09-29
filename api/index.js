@@ -228,6 +228,151 @@ add('pokemon', 'Fun', 'Pokemon info', { name: 'pikachu' }, async (q) => {
   return { id: d.id, name: d.name, height: d.height, weight: d.weight, types: d.types.map((t) => t.type.name), abilities: d.abilities.map((a) => a.ability.name), image: d.sprites.other['official-artwork'].front_default };
 });
 
+// ------------------------- HELPERS FOR SCRAPING -------------------------
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleScript/1.0 Chrome/124.0 Safari/537.36';
+const H = async (url, headers = {}) => {
+  const r = await fetch(url, { signal: AbortSignal.timeout(12000), headers: { 'user-agent': UA, ...headers } });
+  if (!r.ok) throw Object.assign(new Error('Upstream error ' + r.status), { code: 502 });
+  return r.text();
+};
+const strip = (s = '') => s.replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#0?39;|&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/\s+/g, ' ').trim();
+const findAll = (o, key, out = []) => {
+  if (o && typeof o === 'object') {
+    if (o[key]) out.push(o[key]);
+    for (const v of Object.values(o)) findAll(v, key, out);
+  }
+  return out;
+};
+const ytId = (s) => {
+  const m = String(s).match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/|embed\/|live\/))([\w-]{11})/);
+  if (m) return m[1];
+  if (/^[\w-]{11}$/.test(s)) return s;
+  throw Object.assign(new Error('Invalid YouTube link'), { code: 400 });
+};
+const safeUrl = (u) => {
+  let x;
+  try { x = new URL(u); } catch { throw Object.assign(new Error('Invalid URL'), { code: 400 }); }
+  if (!/^https?:$/.test(x.protocol) || /^(localhost|127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(x.hostname))
+    throw Object.assign(new Error('URL not allowed'), { code: 400 });
+  return x.href;
+};
+
+// Downloader engine: any cobalt-compatible server (self-host it, free).
+// Vercel -> Settings -> Environment Variables:  COBALT_URL = https://your-cobalt.up.railway.app/   (COBALT_KEY optional)
+const cobalt = async (url, body) => {
+  const base = process.env.COBALT_URL;
+  if (!base) throw Object.assign(new Error('Downloader engine not set. Add COBALT_URL in Vercel environment variables (see README).'), { code: 501 });
+  const r = await fetch(base, {
+    method: 'POST',
+    signal: AbortSignal.timeout(25000),
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json', ...(process.env.COBALT_KEY ? { Authorization: 'Api-Key ' + process.env.COBALT_KEY } : {}) },
+    body: JSON.stringify({ url, ...body }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (d.status === 'error' || !d.url) throw Object.assign(new Error('Download failed: ' + (d.error?.code || r.status)), { code: 502 });
+  return d;
+};
+const oembed = (id) => J(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${id}&format=json`).catch(() => ({}));
+
+// ------------------------- YOUTUBE -------------------------
+add('ytinfo', 'YouTube', 'Video title, channel and thumbnails', { url: 'https://youtu.be/dQw4w9WgXcQ' }, async (q) => {
+  const id = ytId(need(q, 'url')), o = await oembed(id);
+  return { id, title: o.title, channel: o.author_name, channel_url: o.author_url, link: 'https://youtu.be/' + id,
+    thumbnail: `https://img.youtube.com/vi/${id}/maxresdefault.jpg`, thumbnail_hq: `https://img.youtube.com/vi/${id}/hqdefault.jpg` };
+});
+
+add('ytthumb', 'YouTube', 'Thumbnail image (redirect)', { url: 'https://youtu.be/dQw4w9WgXcQ' }, (q) => ({
+  __redirect: `https://img.youtube.com/vi/${ytId(need(q, 'url'))}/maxresdefault.jpg`,
+}));
+
+add('ytsearch', 'YouTube', 'Search YouTube videos (scraped)', { q: 'lofi music', limit: 8 }, async (q) => {
+  const html = await H('https://www.youtube.com/results?hl=en&search_query=' + enc(need(q, 'q')), { cookie: 'CONSENT=YES+1; SOCS=CAI', 'accept-language': 'en-US,en;q=0.9' });
+  const m = html.match(/var ytInitialData = (\{.+?\});<\/script>/s);
+  if (!m) throw Object.assign(new Error('YouTube blocked the request, try again'), { code: 502 });
+  const vids = findAll(JSON.parse(m[1]), 'videoRenderer').slice(0, num(q.limit, 8, 1, 20));
+  return vids.map((v) => ({
+    id: v.videoId, title: v.title?.runs?.[0]?.text, channel: v.ownerText?.runs?.[0]?.text,
+    duration: v.lengthText?.simpleText, views: v.viewCountText?.simpleText, published: v.publishedTimeText?.simpleText,
+    thumbnail: v.thumbnail?.thumbnails?.slice(-1)[0]?.url, url: 'https://youtu.be/' + v.videoId,
+  }));
+});
+
+add('ytmp3', 'Downloader', 'YouTube to MP3 download link', { url: 'https://youtu.be/dQw4w9WgXcQ' }, async (q) => {
+  const id = ytId(need(q, 'url')), [d, o] = await Promise.all([cobalt('https://youtu.be/' + id, { downloadMode: 'audio', audioFormat: 'mp3' }), oembed(id)]);
+  return { title: o.title, channel: o.author_name, thumbnail: `https://img.youtube.com/vi/${id}/hqdefault.jpg`, filename: d.filename, download: d.url };
+});
+
+add('ytmp4', 'Downloader', 'YouTube to MP4 download link', { url: 'https://youtu.be/dQw4w9WgXcQ', quality: '720' }, async (q) => {
+  const id = ytId(need(q, 'url')), qual = ['360', '480', '720', '1080'].includes(q.quality) ? q.quality : '720';
+  const [d, o] = await Promise.all([cobalt('https://youtu.be/' + id, { downloadMode: 'auto', videoQuality: qual }), oembed(id)]);
+  return { title: o.title, channel: o.author_name, quality: qual, thumbnail: `https://img.youtube.com/vi/${id}/hqdefault.jpg`, filename: d.filename, download: d.url };
+});
+
+add('download', 'Downloader', 'Any supported link (Instagram, X, Facebook, Reddit ...)', { url: 'https://x.com/user/status/1' }, async (q) => {
+  const d = await cobalt(safeUrl(need(q, 'url')), { downloadMode: 'auto' });
+  return { filename: d.filename, download: d.url };
+});
+
+add('tiktok', 'Downloader', 'TikTok video without watermark', { url: 'https://www.tiktok.com/@user/video/123' }, async (q) => {
+  const d = await J('https://www.tikwm.com/api/?url=' + enc(need(q, 'url')));
+  if (d.code !== 0) throw Object.assign(new Error(d.msg || 'TikTok fetch failed'), { code: 502 });
+  const f = (u) => (u && u.startsWith('/') ? 'https://www.tikwm.com' + u : u), x = d.data;
+  return { title: x.title, author: x.author?.nickname, duration: x.duration, cover: f(x.cover), video: f(x.play), video_watermark: f(x.wmplay), music: f(x.music) };
+});
+
+// ------------------------- SCRAPERS -------------------------
+add('search', 'Scrape', 'Web search results (scraped from DuckDuckGo)', { q: 'vercel serverless functions', limit: 8 }, async (q) => {
+  const html = await H('https://html.duckduckgo.com/html/?q=' + enc(need(q, 'q')));
+  const re = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+  const out = []; let m;
+  while ((m = re.exec(html)) && out.length < num(q.limit, 8, 1, 20)) {
+    let link = m[1];
+    try { link = new URL(link.startsWith('//') ? 'https:' + link : link).searchParams.get('uddg') || link; } catch {}
+    out.push({ title: strip(m[2]), url: link, snippet: strip(m[3]) });
+  }
+  if (!out.length) throw Object.assign(new Error('No results (or search engine blocked the request)'), { code: 404 });
+  return out;
+});
+
+add('webinfo', 'Scrape', 'Scrape title, description, image and links of any page', { url: 'https://github.com' }, async (q) => {
+  const url = safeUrl(need(q, 'url')), html = await H(url);
+  const meta = (n) => (html.match(new RegExp(`<meta[^>]+(?:property|name)=["']${n}["'][^>]+content=["']([^"']*)`, 'i')) || [])[1];
+  return {
+    url, title: strip((html.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1]),
+    description: meta('og:description') || meta('description'), image: meta('og:image'),
+    links: (html.match(/<a\s[^>]*href=/gi) || []).length, images: (html.match(/<img\s/gi) || []).length,
+  };
+});
+
+add('quotes', 'Scrape', 'Quotes scraped from quotes.toscrape.com', { tag: '', page: 1 }, async (q) => {
+  const path = q.tag ? `/tag/${enc(q.tag)}/page/${num(q.page, 1, 1, 10)}/` : `/page/${num(q.page, 1, 1, 10)}/`;
+  const html = await H('https://quotes.toscrape.com' + path);
+  const re = /<span class="text"[^>]*>([\s\S]*?)<\/span>[\s\S]*?<small class="author"[^>]*>([\s\S]*?)<\/small>/g;
+  const out = []; let m;
+  while ((m = re.exec(html))) out.push({ quote: strip(m[1]), author: strip(m[2]) });
+  if (!out.length) throw Object.assign(new Error('No quotes found'), { code: 404 });
+  return out;
+});
+
+add('hackernews', 'Scrape', 'Top Hacker News stories', { limit: 10 }, async (q) => {
+  const ids = (await J('https://hacker-news.firebaseio.com/v0/topstories.json')).slice(0, num(q.limit, 10, 1, 30));
+  const items = await Promise.all(ids.map((i) => J(`https://hacker-news.firebaseio.com/v0/item/${i}.json`)));
+  return items.map((i) => ({ title: i.title, url: i.url || `https://news.ycombinator.com/item?id=${i.id}`, score: i.score, by: i.by, comments: i.descendants }));
+});
+
+// ------------------------- MEDIA -------------------------
+add('lyrics', 'Media', 'Song lyrics (LRCLIB)', { q: 'Shape of You Ed Sheeran' }, async (q) => {
+  const d = await J('https://lrclib.net/api/search?q=' + enc(need(q, 'q')));
+  if (!d.length) throw Object.assign(new Error('Lyrics not found'), { code: 404 });
+  const s = d[0];
+  return { title: s.trackName, artist: s.artistName, album: s.albumName, duration: s.duration, lyrics: s.plainLyrics, synced: s.syncedLyrics };
+});
+
+add('anime', 'Media', 'Anime search (Jikan / MyAnimeList)', { q: 'naruto' }, async (q) => {
+  const d = await J('https://api.jikan.moe/v4/anime?limit=5&q=' + enc(need(q, 'q')));
+  return d.data.map((a) => ({ title: a.title, type: a.type, episodes: a.episodes, score: a.score, status: a.status, year: a.year, synopsis: a.synopsis, image: a.images?.jpg?.image_url, url: a.url }));
+});
+
 // ------------------------- ROUTER -------------------------
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
