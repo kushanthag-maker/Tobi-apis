@@ -1,0 +1,7 @@
+{
+  "name": "nexus-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Free public REST API collection. No login, no API key, no database.",
+  "engines": { "node": "20.x" }
+}
