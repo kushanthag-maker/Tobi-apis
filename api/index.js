@@ -10,20 +10,38 @@ const add = (path, category, desc, params, fn) => {
   routes[path] = { category, desc, params, fn };
 };
 
-const J = async (url, opts = {}) => {
-  const r = await fetch(url, {
-    signal: AbortSignal.timeout(10000),
-    headers: { 'user-agent': 'Mozilla/5.0 NexusAPI' },
-    ...opts,
-  });
-  if (!r.ok) throw Object.assign(new Error('Upstream error ' + r.status), { code: 502 });
-  return r.json();
+const J = async (url, opts = {}, tries = 2) => {
+  const host = new URL(url).host;
+  let err;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(9000), ...opts, headers: { 'user-agent': UA, accept: 'application/json', ...(opts.headers || {}) } });
+      if (r.ok) {
+        const t = await r.text();
+        try { return JSON.parse(t); } catch { err = Object.assign(new Error(`Invalid response (${host})`), { code: 502 }); }
+      } else {
+        err = Object.assign(new Error(`Upstream error ${r.status} (${host})`), { code: 502 });
+        if (r.status < 500 && r.status !== 429) break;
+      }
+    } catch (e) {
+      err = Object.assign(new Error(`${e.name === 'TimeoutError' ? 'Timeout' : 'Network error'} (${host})`), { code: 502 });
+    }
+    await new Promise((r) => setTimeout(r, 600));
+  }
+  throw err;
 };
 const T = async (url) => {
-  const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
+  const r = await fetch(url, { signal: AbortSignal.timeout(10000), headers: { 'user-agent': UA } });
   if (!r.ok) throw Object.assign(new Error('Upstream error ' + r.status), { code: 502 });
   return r.text();
 };
+// try providers one by one until one works
+const any = async (...fns) => {
+  let last;
+  for (const f of fns) { try { return await f(); } catch (e) { last = e; } }
+  throw last;
+};
+const nf = (m) => Object.assign(new Error(m), { code: 404 });
 const need = (q, k) => {
   if (!q[k]) throw Object.assign(new Error('Missing parameter: ' + k), { code: 400 });
   return String(q[k]);
@@ -131,10 +149,13 @@ add('screenshot', 'Utility', 'Website screenshot image', { url: 'https://github.
   __redirect: `https://image.thum.io/get/width/1200/${need(q, 'url')}`,
 }));
 
-add('shorten', 'Utility', 'Shorten a URL (TinyURL)', { url: 'https://github.com' }, async (q) => ({
-  short: (await T('https://tinyurl.com/api-create.php?url=' + enc(need(q, 'url')))).trim(),
-}));
-
+add('shorten', 'Utility', 'Shorten a URL (TinyURL / is.gd)', { url: 'https://github.com' }, async (q) => {
+  const u = safeUrl(need(q, 'url'));
+  return any(
+    async () => ({ short: (await T('https://tinyurl.com/api-create.php?url=' + enc(u))).trim() }),
+    async () => ({ short: (await T('https://is.gd/create.php?format=simple&url=' + enc(u))).trim() }),
+  );
+});
 // ------------------------- INFO -------------------------
 add('weather', 'Info', 'Current weather for a city', { city: 'Colombo' }, async (q) => {
   const g = await J(`https://geocoding-api.open-meteo.com/v1/search?name=${enc(need(q, 'city'))}&count=1`);
@@ -187,7 +208,7 @@ add('ipinfo', 'Info', 'IP geolocation', { ip: '8.8.8.8' }, async (q, req) => {
 
 // ------------------------- DEV -------------------------
 add('github', 'Dev', 'GitHub user profile', { user: 'torvalds' }, async (q) => {
-  const d = await J('https://api.github.com/users/' + enc(need(q, 'user')));
+  const d = await J('https://api.github.com/users/' + enc(need(q, 'user')), { headers: process.env.GITHUB_TOKEN ? { authorization: 'Bearer ' + process.env.GITHUB_TOKEN } : {} });
   return { login: d.login, name: d.name, bio: d.bio, avatar: d.avatar_url, followers: d.followers, following: d.following, repos: d.public_repos, created: d.created_at, url: d.html_url };
 });
 
@@ -197,11 +218,14 @@ add('npm', 'Dev', 'npm package info', { package: 'express' }, async (q) => {
 });
 
 // ------------------------- FUN -------------------------
-add('joke', 'Fun', 'Random joke', {}, async () => J('https://official-joke-api.appspot.com/random_joke'));
-add('quote', 'Fun', 'Random quote', {}, async () => {
-  const d = await J('https://dummyjson.com/quotes/random');
-  return { quote: d.quote, author: d.author };
-});
+add('joke', 'Fun', 'Random joke', {}, () => any(
+  async () => { const d = await J('https://official-joke-api.appspot.com/random_joke'); return { setup: d.setup, punchline: d.punchline }; },
+  async () => { const d = await J('https://v2.jokeapi.dev/joke/Any?safe-mode&type=twopart'); return { setup: d.setup, punchline: d.delivery }; },
+));
+add('quote', 'Fun', 'Random quote', {}, () => any(
+  async () => { const d = await J('https://dummyjson.com/quotes/random'); return { quote: d.quote, author: d.author }; },
+  async () => { const d = await J('https://zenquotes.io/api/random'); return { quote: d[0].q, author: d[0].a }; },
+));
 add('fact', 'Fun', 'Random fact', {}, async () => {
   const d = await J('https://uselessfacts.jsph.pl/api/v2/facts/random?language=en');
   return { fact: d.text };
@@ -215,21 +239,21 @@ add('dog', 'Fun', 'Random dog image', {}, async () => {
   const d = await J('https://dog.ceo/api/breeds/image/random');
   return { image: d.message };
 });
-add('meme', 'Fun', 'Random meme', {}, async () => {
-  const d = await J('https://meme-api.com/gimme');
-  return { title: d.title, image: d.url, subreddit: d.subreddit };
-});
-add('trivia', 'Fun', 'Random trivia question', {}, async () => {
-  const d = await J('https://opentdb.com/api.php?amount=1');
-  return d.results[0];
-});
+add('meme', 'Fun', 'Random meme', {}, () => any(
+  async () => { const d = await J('https://meme-api.com/gimme'); if (!d.url) throw nf('none'); return { title: d.title, image: d.url, subreddit: d.subreddit }; },
+  async () => { const m = (await J('https://api.imgflip.com/get_memes')).data.memes; const x = m[crypto.randomInt(m.length)]; return { title: x.name, image: x.url, subreddit: 'imgflip' }; },
+));
+add('trivia', 'Fun', 'Random trivia question', {}, () => any(
+  async () => { const d = await J('https://opentdb.com/api.php?amount=1'); if (!d.results?.length) throw nf('none'); return d.results[0]; },
+  async () => { const x = (await J('https://the-trivia-api.com/v2/questions?limit=1'))[0]; return { category: x.category, difficulty: x.difficulty, question: x.question.text, correct_answer: x.correctAnswer, incorrect_answers: x.incorrectAnswers }; },
+));
 add('pokemon', 'Fun', 'Pokemon info', { name: 'pikachu' }, async (q) => {
   const d = await J('https://pokeapi.co/api/v2/pokemon/' + enc(need(q, 'name').toLowerCase()));
   return { id: d.id, name: d.name, height: d.height, weight: d.weight, types: d.types.map((t) => t.type.name), abilities: d.abilities.map((a) => a.ability.name), image: d.sprites.other['official-artwork'].front_default };
 });
 
 // ------------------------- HELPERS FOR SCRAPING -------------------------
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleScript/1.0 Chrome/124.0 Safari/537.36';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 const H = async (url, headers = {}) => {
   const r = await fetch(url, { signal: AbortSignal.timeout(12000), headers: { 'user-agent': UA, ...headers } });
   if (!r.ok) throw Object.assign(new Error('Upstream error ' + r.status), { code: 502 });
@@ -368,11 +392,28 @@ add('lyrics', 'Media', 'Song lyrics (LRCLIB)', { q: 'Shape of You Ed Sheeran' },
   return { title: s.trackName, artist: s.artistName, album: s.albumName, duration: s.duration, lyrics: s.plainLyrics, synced: s.syncedLyrics };
 });
 
-add('anime', 'Media', 'Anime search (Jikan / MyAnimeList)', { q: 'naruto' }, async (q) => {
-  const d = await J('https://api.jikan.moe/v4/anime?limit=5&q=' + enc(need(q, 'q')));
-  return d.data.map((a) => ({ title: a.title, type: a.type, episodes: a.episodes, score: a.score, status: a.status, year: a.year, synopsis: a.synopsis, image: a.images?.jpg?.image_url, url: a.url }));
+add('anime', 'Media', 'Anime search (Jikan, AniList, Kitsu fallback)', { q: 'naruto' }, async (q) => {
+  const s = need(q, 'q');
+  return any(
+    async () => {
+      const d = (await J('https://api.jikan.moe/v4/anime?limit=5&q=' + enc(s))).data;
+      if (!d?.length) throw nf('Anime not found');
+      return d.map((a) => ({ title: a.title, type: a.type, episodes: a.episodes, score: a.score, status: a.status, year: a.year, synopsis: a.synopsis, image: a.images?.jpg?.image_url, url: a.url }));
+    },
+    async () => {
+      const d = await J('https://graphql.anilist.co', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+        query: 'query($s:String){Page(perPage:5){media(search:$s,type:ANIME){title{romaji english} format episodes averageScore status seasonYear description(asHtml:false) coverImage{large} siteUrl}}}', variables: { s } }) });
+      const m = d.data?.Page?.media;
+      if (!m?.length) throw nf('Anime not found');
+      return m.map((a) => ({ title: a.title.english || a.title.romaji, type: a.format, episodes: a.episodes, score: a.averageScore ? a.averageScore / 10 : null, status: a.status, year: a.seasonYear, synopsis: a.description, image: a.coverImage?.large, url: a.siteUrl }));
+    },
+    async () => {
+      const d = (await J('https://kitsu.io/api/edge/anime?page[limit]=5&filter[text]=' + enc(s), { headers: { accept: 'application/vnd.api+json' } })).data;
+      if (!d?.length) throw nf('Anime not found');
+      return d.map((x) => ({ title: x.attributes.canonicalTitle, type: x.attributes.subtype, episodes: x.attributes.episodeCount, score: x.attributes.averageRating, status: x.attributes.status, year: (x.attributes.startDate || '').slice(0, 4), synopsis: x.attributes.synopsis, image: x.attributes.posterImage?.small, url: 'https://kitsu.io/anime/' + x.attributes.slug }));
+    }
+  );
 });
-
 // ------------------------- ROUTER -------------------------
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
